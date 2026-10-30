@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
+	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	"github.com/opencloud-eu/reva/v2/pkg/storage/utils/decomposedfs/node"
 	helpers "github.com/opencloud-eu/reva/v2/pkg/storage/utils/decomposedfs/testhelpers"
 	"github.com/opencloud-eu/reva/v2/pkg/storagespace"
@@ -209,9 +210,10 @@ var _ = Describe("Spaces", func() {
 
 	Describe("List spaces with personal space permissions", func() {
 		var (
-			env        *helpers.TestEnv
-			spaceadmin *userv1beta1.User
-			admin      *userv1beta1.User
+			env          *helpers.TestEnv
+			spaceadmin   *userv1beta1.User
+			admin        *userv1beta1.User
+			projectSpace *provider.StorageSpace
 		)
 
 		BeforeEach(func() {
@@ -231,6 +233,8 @@ var _ = Describe("Spaces", func() {
 					return []string{"Drives.Create", "Drives.List", "Drives.ListPersonal", "Drives.ReadWrite", "Drives.ReadWritePersonal"}
 				case env.Owner.GetId().GetOpaqueId():
 					return []string{"Drives.Create"} // setup actor
+				case env.DeleteAllSpacesUser.GetId().GetOpaqueId():
+					return []string{"Drives.ListPersonal"} // custom role without Drives.List
 				}
 				return []string{}
 			}
@@ -260,15 +264,16 @@ var _ = Describe("Spaces", func() {
 					return node.NoPermissions()
 				}, nil)
 
-			createSpace := func(req *provider.CreateStorageSpaceRequest) {
+			createSpace := func(req *provider.CreateStorageSpaceRequest) *provider.StorageSpace {
 				resp, err := env.Fs.CreateStorageSpace(env.Ctx, req)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(resp.GetStatus().GetCode()).To(Equal(rpcv1beta1.Code_CODE_OK))
+				return resp.GetStorageSpace()
 			}
 			// personal spaces of the other users, in addition to the owner's own one
 			createSpace(&provider.CreateStorageSpaceRequest{Owner: spaceadmin, Name: "spaceadmin", Type: "personal"})
 			createSpace(&provider.CreateStorageSpaceRequest{Owner: admin, Name: "admin", Type: "personal"})
-			createSpace(&provider.CreateStorageSpaceRequest{Name: "Project A", Type: "project"})
+			projectSpace = createSpace(&provider.CreateStorageSpaceRequest{Name: "Project A", Type: "project"})
 			createSpace(&provider.CreateStorageSpaceRequest{Name: "Project B", Type: "project"})
 		})
 
@@ -311,6 +316,37 @@ var _ = Describe("Spaces", func() {
 			spaces, err := env.Fs.ListStorageSpaces(ctxpkg.ContextSetUser(context.Background(), spaceadmin), nil, false)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(spaceNames(spaces)).To(ConsistOf("spaceadmin"))
+		})
+
+		It("only lists the personal spaces of another user with Drives.ListPersonal", func() {
+			// the requested user's groups would normally be resolved via the gateway
+			Expect(env.Fs.UserCache.Set(admin.GetId().GetOpaqueId(), admin)).To(Succeed())
+
+			spaces, err := env.Fs.ListStorageSpaces(
+				ctxpkg.ContextSetUser(context.Background(), env.DeleteAllSpacesUser),
+				[]*provider.ListStorageSpacesRequest_Filter{
+					{Type: provider.ListStorageSpacesRequest_Filter_TYPE_USER, Term: &provider.ListStorageSpacesRequest_Filter_User{User: admin.GetId()}},
+				},
+				true,
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(spaceNames(spaces)).To(ConsistOf("admin"))
+		})
+
+		It("space admin can read the quota of a project space", func() {
+			_, _, _, err := env.Fs.GetQuota(ctxpkg.ContextSetUser(context.Background(), spaceadmin), &provider.Reference{ResourceId: projectSpace.GetRoot()})
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("space admin cannot read the quota of another user's personal space", func() {
+			_, _, _, err := env.Fs.GetQuota(ctxpkg.ContextSetUser(context.Background(), spaceadmin), &provider.Reference{ResourceId: env.SpaceRootRes})
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(BeAssignableToTypeOf(errtypes.NotFound("")))
+		})
+
+		It("admin can read the quota of another user's personal space", func() {
+			_, _, _, err := env.Fs.GetQuota(ctxpkg.ContextSetUser(context.Background(), admin), &provider.Reference{ResourceId: env.SpaceRootRes})
+			Expect(err).ToNot(HaveOccurred())
 		})
 	})
 
